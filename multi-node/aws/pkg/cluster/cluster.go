@@ -91,12 +91,12 @@ func (c *Cluster) Create(stackBody string) error {
 		}
 		statusString := aws.StringValue(resp.Stacks[0].StackStatus)
 		switch statusString {
-		case cloudformation.ResourceStatusUpdateComplete:
+		case cloudformation.ResourceStatusCreateComplete:
 			return nil
-		case cloudformation.ResourceStatusUpdateFailed, cloudformation.StackStatusUpdateRollbackComplete, cloudformation.StackStatusUpdateRollbackFailed:
-			errMsg := fmt.Sprintf("Stack status: %s : %s", statusString, aws.StringValue(resp.Stacks[0].StackStatusReason))
+		case cloudformation.ResourceStatusCreateFailed:
+			errMsg := fmt.Sprintf("Stack creation failed: %s : %s", statusString, aws.StringValue(resp.Stacks[0].StackStatusReason))
 			return errors.New(errMsg)
-		case cloudformation.ResourceStatusUpdateInProgress:
+		case cloudformation.ResourceStatusCreateInProgress:
 			time.Sleep(3 * time.Second)
 			continue
 		default:

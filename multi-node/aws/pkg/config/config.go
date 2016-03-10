@@ -10,8 +10,10 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net"
+	"strings"
 	"text/template"
 
+	"github.com/coreos/coreos-cloudinit/config/validate"
 	"gopkg.in/yaml.v2"
 )
 
@@ -45,12 +47,23 @@ func ClusterFromFile(filename string) (*Cluster, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	c, err := clusterFromBytes(data)
+	if err != nil {
+		return nil, fmt.Errorf("file %s: %v", filename, err)
+	}
+
+	return c, nil
+}
+
+//Necessary for unit tests, which store configs as hardcoded strings
+func clusterFromBytes(data []byte) (*Cluster, error) {
 	c := newDefaultCluster()
 	if err := yaml.Unmarshal(data, c); err != nil {
-		return nil, fmt.Errorf("failed to parse %s: %v", filename, err)
+		return nil, fmt.Errorf("failed to parse cluster: %v", err)
 	}
 	if err := c.valid(); err != nil {
-		return nil, fmt.Errorf("%s is invalid: %v", filename, err)
+		return nil, fmt.Errorf("invalid cluster: %v", err)
 	}
 	return c, nil
 }
@@ -85,9 +98,14 @@ func (c Cluster) Config(tlsConfig *RawTLSAssets) (*Config, error) {
 	config.SecureAPIServers = fmt.Sprintf("https://%s:443", c.ControllerIP)
 	config.APIServerEndpoint = fmt.Sprintf("https://%s", c.ExternalDNSName)
 
+	var err error
+	if config.AMI, err = getAMI(config.Region, config.ReleaseChannel); err != nil {
+		return nil, fmt.Errorf("failed getting AMI for config: %v", err)
+	}
+
 	compact, err := tlsConfig.Compact()
 	if err != nil {
-		return nil, fmt.Errorf("Failed to compress TLS assets: %v", err)
+		return nil, fmt.Errorf("failed to compress TLS assets: %v", err)
 	}
 	config.TLSConfig = compact
 
@@ -101,50 +119,106 @@ type StackTemplateOptions struct {
 	StackTemplateTmplFile string
 }
 
-func (c Cluster) RenderStackTemplate(opts StackTemplateOptions) ([]byte, error) {
+type stackConfig struct {
+	*Config
+	UserDataWorker     string
+	UserDataController string
+}
+
+func execute(filename string, data interface{}, compress bool) (string, error) {
+	raw, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return "", err
+	}
+	tmpl, err := template.New(filename).Parse(string(raw))
+	if err != nil {
+		return "", err
+	}
+	var buff bytes.Buffer
+	if err := tmpl.Execute(&buff, data); err != nil {
+		return "", err
+	}
+	if compress {
+		return compressData(buff.Bytes())
+	}
+	return buff.String(), nil
+}
+
+func (c Cluster) stackConfig(opts StackTemplateOptions, compressUserData bool) (*stackConfig, error) {
 	assets, err := ReadTLSAssets(opts.TLSAssetsDir)
 	if err != nil {
 		return nil, err
 	}
-	config, err := c.Config(assets)
-	if err != nil {
+	stackConfig := stackConfig{}
+
+	if stackConfig.Config, err = c.Config(assets); err != nil {
 		return nil, err
 	}
-	execute := func(filename string, data interface{}, compress bool) (string, error) {
-		raw, err := ioutil.ReadFile(filename)
-		if err != nil {
-			return "", err
-		}
-		tmpl, err := template.New(filename).Parse(string(raw))
-		if err != nil {
-			return "", err
-		}
-		var buff bytes.Buffer
-		if err := tmpl.Execute(&buff, data); err != nil {
-			return "", err
-		}
-		if compress {
-			return compressData(buff.Bytes())
-		}
-		return buff.String(), nil
-	}
 
-	userDataWorker, err := execute(opts.WorkerTmplFile, config, true)
-	if err != nil {
+	if stackConfig.UserDataWorker, err = execute(opts.WorkerTmplFile, stackConfig.Config, compressUserData); err != nil {
 		return nil, fmt.Errorf("failed to render worker cloud config: %v", err)
 	}
-	userDataController, err := execute(opts.ControllerTmplFile, config, true)
-	if err != nil {
+	if stackConfig.UserDataController, err = execute(opts.ControllerTmplFile, stackConfig.Config, compressUserData); err != nil {
 		return nil, fmt.Errorf("failed to render controller cloud config: %v", err)
 	}
 
-	data := struct {
-		*Config
-		UserDataWorker     string
-		UserDataController string
-	}{config, userDataWorker, userDataController}
+	return &stackConfig, nil
+}
 
-	rendered, err := execute(opts.StackTemplateTmplFile, data, false)
+func (c Cluster) ValidateUserData(opts StackTemplateOptions) error {
+	stackConfig, err := c.stackConfig(opts, false)
+	if err != nil {
+		return err
+	}
+
+	errors := []string{}
+
+	for _, userData := range []struct {
+		Name    string
+		Content string
+	}{
+		{
+			Content: stackConfig.UserDataWorker,
+			Name:    "UserDataWorker",
+		},
+		{
+			Content: stackConfig.UserDataController,
+			Name:    "UserDataController",
+		},
+	} {
+		report, err := validate.Validate([]byte(userData.Content))
+
+		if err != nil {
+			errors = append(
+				errors,
+				fmt.Sprintf("cloud-config %s could not be parsed: %v",
+					userData.Name,
+					err,
+				),
+			)
+			continue
+		}
+
+		for _, entry := range report.Entries() {
+			errors = append(errors, fmt.Sprintf("%s: %+v", userData.Name, entry))
+		}
+	}
+
+	if len(errors) > 0 {
+		reportString := strings.Join(errors, "\n")
+		return fmt.Errorf("cloud-config validation errors:\n%s\n", reportString)
+	}
+
+	return nil
+}
+
+func (c Cluster) RenderStackTemplate(opts StackTemplateOptions) ([]byte, error) {
+	stackConfig, err := c.stackConfig(opts, true)
+	if err != nil {
+		return nil, err
+	}
+
+	rendered, err := execute(opts.StackTemplateTmplFile, stackConfig, false)
 	if err != nil {
 		return nil, err
 	}
